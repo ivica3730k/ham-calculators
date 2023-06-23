@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>LC Delay Circuit Calculator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 2rem;
+    }
+
+    .container {
+      display: flex;
+      gap: 10px;
+    }
+
+    .calculator {
+      flex: 1;
+      /* Take up 50% of the container */
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .photo {
+      flex: 1;
+      /* Take up 50% of the container */
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .input-group input {
+      margin-top: 5px;
+    }
+
+    .results {
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>LC Delay Circuit Calculator</h1>
+  <div class="container">
+    <div class="calculator">
+      <div class="input-group">
+        <label for="Z">Z (Impedance):</label>
+        <input type="number" id="Z">
+        <select id="Z_unit">
+          <option value="1">Base (Ohms)</option>
+          <option value="1e3">Kilo (kOhms)</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label for="T">T (Time delay):</label>
+        <input type="number" id="T">
+        <select id="T_unit">
+          <option value="1">Base (s)</option>
+          <option value="1e-3">Milli (ms)</option>
+          <option value="1e-6">Micro (us)</option>
+          <option value="1e-9" selected>Nano (ns)</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label for="L">L (Inductance):</label>
+        <input type="number" id="L">
+        <select id="L_unit">
+          <option value="1">Base (H)</option>
+          <option value="1e-3">Milli (mH)</option>
+          <option value="1e-6">Micro (uH)</option>
+          <option value="1e-9" selected>Nano (nH)</option>
+          <option value="1e-12">Pico (pH)</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label for="C">C (Capacitance):</label>
+        <input type="number" id="C">
+        <select id="C_unit">
+          <option value="1">Base (F)</option>
+          <option value="1e-3">Milli (mF)</option>
+          <option value="1e-6">Micro (uF)</option>
+          <option value="1e-9">Nano (nF)</option>
+          <option value="1e-12" selected>Pico (pF)</option>
+        </select>
+      </div>
+      <button onclick="calculateValues()">Calculate</button>
+      <button type="button" onclick="window.location.reload();">Reset</button>
+      <div id="output" class="results">
+        Output will appear here.
+      </div>
+    </div>
+    <div class="photo">
+      <img src="./lc-delay-circuit.jpeg" alt="LC Delay Circuit" width="100%">
+    </div>
+  </div>
+
+  <script>
+    window.onload = function () {
+      let dropdowns = document.getElementsByTagName('select');
+      for (let i = 0; i < dropdowns.length; i++) {
+        dropdowns[i].addEventListener('change', recalculateValues);
+      }
+    };
+
+    function recalculateValues() {
+      let inputs = document.getElementsByTagName('input');
+      for (let i = 0; i < inputs.length; i++) {
+        if (inputs[i].style.color === 'red') {
+          inputs[i].value = '';
+        }
+      }
+    }
+
+    function calculateValues() {
+      let Z = document.getElementById('Z').value * (document.getElementById('Z_unit').value);
+      let T = document.getElementById('T').value * (document.getElementById('T_unit').value);
+      let L = document.getElementById('L').value * (document.getElementById('L_unit').value);
+      let C = document.getElementById('C').value * (document.getElementById('C_unit').value);
+      let values = [Z, T, L, C];
+      let count = values.filter(val => val).length;
+      if (count !== 2) {
+        alert("Please input exactly two values.");
+        return;
+      }
+
+      if (Z && T) {
+        L = Z * T;
+        C = T / Z;
+        document.getElementById('L').style.color = 'red';
+        document.getElementById('C').style.color = 'red';
+      } else if (Z && L) {
+        T = L / Z;
+        C = T / Z;
+        document.getElementById('T').style.color = 'red';
+        document.getElementById('C').style.color = 'red';
+      } else if (Z && C) {
+        L = Math.pow(Z, 2) * C;
+        T = Math.sqrt(L * C);
+        document.getElementById('L').style.color = 'red';
+        document.getElementById('T').style.color = 'red';
+      } else if (T && L) {
+        C = Math.pow(T, 2) / L;
+        Z = Math.sqrt(L / C);
+        document.getElementById('C').style.color = 'red';
+        document.getElementById('Z').style.color = 'red';
+      } else if (T && C) {
+        L = Math.pow(T, 2) / C;
+        Z = Math.sqrt(L / C);
+        document.getElementById('L').style.color = 'red';
+        document.getElementById('Z').style.color = 'red';
+      } else if (L && C) {
+        T = Math.sqrt(L * C);
+        Z = Math.sqrt(L / C);
+        document.getElementById('T').style.color = 'red';
+        document.getElementById('Z').style.color = 'red';
+      }
+
+      // Update the input boxes with the calculated values
+      document.getElementById('Z').value = parseFloat(Z * (1 / document.getElementById('Z_unit').value)).toFixed(3);
+      document.getElementById('T').value = parseFloat(T * (1 / document.getElementById('T_unit').value)).toFixed(3);
+      document.getElementById('L').value = parseFloat(L * (1 / document.getElementById('L_unit').value)).toFixed(3);
+      document.getElementById('C').value = parseFloat(C * (1 / document.getElementById('C_unit').value)).toFixed(3);
+
+      let convertUnits = (value) => {
+        let milli = value * 1 / 1e-3;
+        let micro = value * 1 / 1e-6;
+        let nano = value * 1 / 1e-9;
+        let pico = value * 1 / 1e-12;
+        let kilo = value * 1 / 1e3;
+        return { milli, micro, nano, pico, kilo };
+      };
+
+      let L_converted = convertUnits(L);
+      let C_converted = convertUnits(C);
+      let T_converted = convertUnits(T);
+      let Z_converted = convertUnits(Z);
+
+      let output = `
+                <h3>Results:</h3>
+                <p>Z (Impedance): ${Z.toFixed(3)} Ohms <br>
+                - in kiloOhms (kOhms): ${Z_converted.kilo.toFixed(3)}</p>
+
+                <p>T (Time delay): ${T.toFixed(3)} s <br>
+                - in milliSeconds (ms): ${T_converted.milli.toFixed(3)} <br>
+                - in microSeconds (us): ${T_converted.micro.toFixed(3)} <br>
+                - in nanoSeconds (ns): ${T_converted.nano.toFixed(3)}</p>
+
+                <p>Inductance L: ${L.toFixed(3)} H <br>
+                - in milliHenries (mH): ${L_converted.milli.toFixed(3)} <br>
+                - in microHenries (uH): ${L_converted.micro.toFixed(3)} <br>
+                - in nanoHenries (nH): ${L_converted.nano.toFixed(3)} <br>
+                - in picoHenries (pH): ${L_converted.pico.toFixed(3)}</p>
+
+                <p>Capacitance C: ${C.toFixed(3)} F <br>
+                - in milliFarads (mF): ${C_converted.milli.toFixed(3)} <br>
+                - in microFarads (uF): ${C_converted.micro.toFixed(3)} <br>
+                - in nanoFarads (nF): ${C_converted.nano.toFixed(3)} <br>
+                - in picoFarads (pF): ${C_converted.pico.toFixed(3)}</p>
+            `;
+      document.getElementById('output').innerHTML = output;
+    }
+  </script>
+</body>
+
+</html>
