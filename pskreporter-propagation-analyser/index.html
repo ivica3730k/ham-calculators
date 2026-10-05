@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PSKReporter Propagation Analyser</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.5/babel.min.js"></script>
+
+  <style>
+    html, body { font-family: 'Lato', system-ui, sans-serif; }
+    .tabnum { font-variant-numeric: tabular-nums; }
+    .recharts-cartesian-axis-tick text { font-size: 11px; }
+  </style>
+
+  <script src="./continents.js"></script>
+  <script src="./analysis.js"></script>
+</head>
+
+<body class="bg-[#fcfcfb] text-[#0b0b0b] dark:bg-[#1a1a19] dark:text-white antialiased">
+  <div id="root" class="max-w-[1400px] mx-auto px-4 py-8"></div>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect, useCallback } = React;
+const {
+  ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid,
+  Tooltip, Legend, ReferenceArea
+} = Recharts;
+
+const C = window.PSKCore;
+const HOURS = Array.from({ length: 24 }, (_, i) => i);
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/* ------------------------------------------------------------------ theme */
+
+function useDark() {
+  const [dark, setDark] = useState(
+    () => window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const fn = (e) => setDark(e.matches);
+    mq.addEventListener('change', fn);
+    return () => mq.removeEventListener('change', fn);
+  }, []);
+  return dark;
+}
+
+/* Continent keeps its own hue everywhere, so a filter never repaints a series. */
+const SERIES = {
+  light: { EU: '#2a78d6', NA: '#eb6834', SA: '#1baf7a', AS: '#eda100', AF: '#e87ba4', OC: '#008300', AN: '#4a3aa7', XX: '#78776f' },
+  dark:  { EU: '#3987e5', NA: '#d95926', SA: '#199e70', AS: '#c98500', AF: '#d55181', OC: '#008300', AN: '#9085e9', XX: '#908f86' }
+};
+
+/* Sequential blue, light -> dark on a light surface and dark -> light on a dark one. */
+const RAMP_LIGHT = ['#cde2fb','#b7d3f6','#9ec5f4','#86b6ef','#6da7ec','#5598e7','#3987e5','#2a78d6','#256abf','#1c5cab','#184f95','#104281','#0d366b'];
+const RAMP_DARK  = [...RAMP_LIGHT].reverse();
+const INK_LIGHT  = RAMP_LIGHT.map((_, i) => (i >= 6 ? '#ffffff' : '#0b0b0b'));
+const INK_DARK   = RAMP_DARK.map((_, i) => (i >= 7 ? '#0b0b0b' : '#ffffff'));
+
+function rampStep(v, lo, hi) {
+  if (hi === lo) return 6;
+  return Math.max(0, Math.min(12, Math.round(((v - lo) / (hi - lo)) * 12)));
+}
+
+/* -------------------------------------------------------------- utilities */
+
+const DIRECTIONS = [
+  { v: 'both', label: 'Both directions' },
+  { v: 'tx', label: 'Others heard me (my TX)' },
+  { v: 'rx', label: 'I heard them (my RX)' }
+];
+
+function hourLabel(h, timebase) {
+  return pad2(h) + ':00 ' + (timebase === 'local' ? 'local' : 'UTC');
+}
+
+function windowLabel(bw, timebase) {
+  if (!bw) return '–';
+  return pad2(bw.start) + ':00–' + pad2(bw.end) + ':00 ' + (timebase === 'local' ? 'local' : 'UTC');
+}
+
+/* ------------------------------------------------------------- components */
+
+/* pskdata.pl serves ADIF straight from PSKReporter but sends no
+   Access-Control-Allow-Origin header, so script can never read the response —
+   that is the server's choice, not something the page can work around. What it
+   can do is navigate to the URL: the reply carries
+   Content-Disposition: attachment, so the browser saves the file and leaves the
+   page standing. With a proxy configured the response becomes readable and the
+   whole thing collapses into one click. */
+const PSK_BASE = 'https://pskreporter.info/cgi-bin/pskdata.pl';
+const SCOPES = [
+  { v: 'callsign', label: 'Both directions' },
+  { v: 'senderCallsign', label: 'Others heard me (my TX)' },
+  { v: 'receiverCallsign', label: 'I heard them (my RX)' }
+];
+
+function pskUrl(call, days, scope) {
+  return `${PSK_BASE}?adif=1&days=${encodeURIComponent(days)}&${scope}=${encodeURIComponent(call)}`;
+}
+
+function FetchPanel({ onText, busy }) {
+  const [call, setCall] = useState('');
+  const [days, setDays] = useState('7');
+  const [scope, setScope] = useState('callsign');
+  const [proxy, setProxy] = useState('');
+  const [note, setNote] = useState(null);
+  const [cool, setCool] = useState(0);
+
+  useEffect(() => {
+    if (cool <= 0) return;
+    const id = setTimeout(() => setCool((c) => c - 1), 1000);
+    return () => clearTimeout(id);
+  }, [cool]);
+
+  /* Navigating to the URL downloads the file; the attachment header keeps this
+     page loaded. Done inside the click handler so no popup blocker intervenes. */
+  const download = (url) => {
+    const a = document.createElement('a');
+    a.href = url;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const run = async () => {
+    const cs = call.trim().toUpperCase();
+    if (!cs) { setNote({ kind: 'warn', text: 'Enter a callsign first.' }); return; }
+    const url = pskUrl(cs, days, scope);
+    const via = proxy.trim();
+    setCool(30);
+
+    if (!via) {
+      download(url);
+      setNote({
+        kind: 'info', url,
+        text: `Downloading ${cs}.adif — drop it on the box to the left when it arrives. ` +
+              `PSKReporter does not let a script read its reply, so this hop through your ` +
+              `downloads folder is unavoidable without a proxy.`
+      });
+      return;
+    }
+
+    setNote({ kind: 'info', text: 'Asking PSKReporter through your proxy…' });
+    try {
+      const res = await fetch(via + encodeURIComponent(url));
+      if (!res.ok) throw new Error('the proxy returned HTTP ' + res.status);
+      const text = await res.text();
+      if (!/<eor>/i.test(text)) throw new Error('that query came back with no records');
+      setNote(null);
+      onText(`${cs}-${days}d.adif`, text);
+    } catch (err) {
+      download(url);
+      setNote({
+        kind: 'warn', url,
+        text: `The proxy did not work out (${err.message}), so ${cs}.adif has been sent to ` +
+              `your downloads instead — drop it on the box to the left.`
+      });
+    }
+  };
+
+  const noteCls = note && note.kind === 'warn'
+    ? 'text-[#52514e] dark:text-[#c3c2b7]'
+    : 'text-[#78776f] dark:text-[#908f86]';
+
+  return (
+    <div className="rounded-lg border border-[#dededa] dark:border-[#383835] bg-[#f4f4f1] dark:bg-[#232322] p-5">
+      <p className="font-bold text-lg mb-0.5">…or pull it by callsign</p>
+      <p className="text-sm text-[#78776f] dark:text-[#908f86] mb-4">
+        Fetch saves the query straight to your downloads, ready to drop on the left.
+        PSKReporter's archive only reaches back a few days.
+      </p>
+      <div className="flex flex-wrap gap-3 items-end">
+        <Field label="Callsign">
+          <input className={selectCls + ' w-32 uppercase font-semibold'} value={call}
+                 placeholder="M7KQU" onChange={(e) => setCall(e.target.value.toUpperCase())}
+                 onKeyDown={(e) => { if (e.key === 'Enter' && !cool) run(); }} />
+        </Field>
+        <Field label="Days back">
+          <select className={selectCls} value={days} onChange={(e) => setDays(e.target.value)}>
+            <option value="1">1</option>
+            <option value="3">3</option>
+            <option value="7">7</option>
+            <option value="14">14</option>
+          </select>
+        </Field>
+        <Field label="Which reports">
+          <select className={selectCls} value={scope} onChange={(e) => setScope(e.target.value)}>
+            {SCOPES.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+          </select>
+        </Field>
+        <button type="button" onClick={run} disabled={busy || cool > 0}
+                className="rounded bg-[#2a78d6] dark:bg-[#3987e5] text-white px-4 py-1.5 text-sm font-semibold disabled:opacity-40">
+          {cool > 0 ? `Wait ${cool}s` : 'Fetch'}
+        </button>
+      </div>
+      {note && (
+        <p className={'text-sm mt-3 ' + noteCls}>
+          {note.text}
+          {note.url && (
+            <React.Fragment>
+              {' '}
+              <a className="text-[#2a78d6] dark:text-[#3987e5] underline" href={note.url}>Download again</a>.
+            </React.Fragment>
+          )}
+        </p>
+      )}
+      <details className="mt-3 text-xs text-[#78776f] dark:text-[#908f86]">
+        <summary className="cursor-pointer">Have a CORS proxy? Make this one click.</summary>
+        <input className={selectCls + ' mt-2 w-full text-xs'} value={proxy}
+               placeholder="https://my-proxy.example/?url="
+               onChange={(e) => setProxy(e.target.value)} />
+        <p className="mt-1">
+          The query URL is appended, URL-encoded, and the reply is parsed in place with no
+          download step. Leave this empty unless you run your own — PSKReporter asks that
+          nobody polls it more than once every few minutes.
+        </p>
+      </details>
+    </div>
+  );
+}
+
+function Dropzone({ onFiles, busy }) {
+  const input = useRef(null);
+  const [over, setOver] = useState(false);
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  return (
+    <div
+      onClick={() => input.current.click()}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.current.click(); } }}
+      onDragEnter={(e) => { stop(e); setOver(true); }}
+      onDragOver={(e) => { stop(e); setOver(true); }}
+      onDragLeave={(e) => { stop(e); setOver(false); }}
+      onDrop={(e) => { stop(e); setOver(false); onFiles(e.dataTransfer.files); }}
+      role="button"
+      tabIndex={0}
+      aria-label="Choose or drop ADIF files"
+      className={'rounded-lg border-2 border-dashed p-8 text-center cursor-pointer transition ' +
+        (over
+          ? 'border-[#2a78d6] bg-[#eaf2fd] dark:border-[#3987e5] dark:bg-[#17233a]'
+          : 'border-[#dededa] bg-[#f4f4f1] hover:border-[#2a78d6] dark:border-[#383835] dark:bg-[#232322] dark:hover:border-[#3987e5]')}
+    >
+      <p className="font-bold text-lg">{busy ? 'Reading…' : 'Drop your .adi / .adif file here'}</p>
+      <p className="text-sm text-[#78776f] dark:text-[#908f86] mt-1">
+        or click to choose &mdash; several files at once is fine
+      </p>
+      <input ref={input} type="file" accept=".adi,.adif,.txt" multiple hidden
+             onChange={(e) => onFiles(e.target.files)} />
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-xs uppercase tracking-wide text-[#78776f] dark:text-[#908f86]">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+const selectCls =
+  'rounded border border-[#dededa] dark:border-[#383835] bg-[#fcfcfb] dark:bg-[#1a1a19] ' +
+  'px-2 py-1.5 text-sm text-[#0b0b0b] dark:text-white';
+
+function Controls({ opts, setOpts, modes, myCall, setMyCall, candidates, dual, onCsv }) {
+  const up = (k) => (e) => {
+    const t = e.target;
+    setOpts({ ...opts, [k]: t.type === 'checkbox' ? t.checked : t.value });
+  };
+  return (
+    <div className="flex flex-wrap items-end gap-4 my-6 p-4 rounded-lg border border-[#dededa] dark:border-[#383835] bg-[#f4f4f1] dark:bg-[#232322]">
+      <Field label="Metric">
+        <select className={selectCls} value={opts.metric} onChange={up('metric')}>
+          <option value="spots">Reports (volume)</option>
+          <option value="calls">Unique stations</option>
+          <option value="rate">Reports per active day</option>
+          <option value="snr">Median SNR</option>
+        </select>
+      </Field>
+      {dual && (
+        <React.Fragment>
+          <Field label="Direction">
+            <select className={selectCls} value={opts.direction} onChange={up('direction')}>
+              {DIRECTIONS.map((d) => <option key={d.v} value={d.v}>{d.label}</option>)}
+            </select>
+          </Field>
+          <Field label="My callsign">
+            <input list="call-candidates" className={selectCls + ' w-32 uppercase'} value={myCall}
+                   onChange={(e) => setMyCall(e.target.value.toUpperCase())} />
+            <datalist id="call-candidates">
+              {candidates.map((c) => <option key={c.call} value={c.call}>{c.n} rows</option>)}
+            </datalist>
+          </Field>
+        </React.Fragment>
+      )}
+      <Field label="Mode">
+        <select className={selectCls} value={opts.mode} onChange={up('mode')}>
+          <option value="ALL">All modes</option>
+          {modes.map((m) => <option key={m.name} value={m.name}>{m.name} ({m.n.toLocaleString()})</option>)}
+        </select>
+      </Field>
+      <Field label="Clock">
+        <select className={selectCls} value={opts.timebase} onChange={up('timebase')}>
+          <option value="utc">UTC</option>
+          <option value="local">Local time</option>
+        </select>
+      </Field>
+      <Field label="Min reports per row">
+        <input type="number" min="1" step="1" className={selectCls + ' w-24 tabnum'}
+               value={opts.minSpots} onChange={up('minSpots')} />
+      </Field>
+      <label className="flex items-center gap-2 text-sm pb-1.5">
+        <input type="checkbox" checked={opts.hfOnly} onChange={up('hfOnly')} />
+        HF only
+      </label>
+      <button type="button" onClick={onCsv}
+              className="ml-auto rounded border border-[#dededa] dark:border-[#383835] px-3 py-1.5 text-sm hover:border-[#2a78d6] hover:text-[#2a78d6] dark:hover:border-[#3987e5] dark:hover:text-[#3987e5]">
+        Download CSV
+      </button>
+    </div>
+  );
+}
+
+function Tiles({ items }) {
+  return (
+    <div className="flex flex-wrap gap-3 mb-8">
+      {items.map((it) => (
+        <div key={it.label} className="flex-1 min-w-[10rem] rounded-md border border-[#dededa] dark:border-[#383835] bg-[#f4f4f1] dark:bg-[#232322] px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wider text-[#78776f] dark:text-[#908f86]">{it.label}</div>
+          <div className="text-base font-bold mt-0.5">{it.value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChartTooltip({ active, payload, label, metric, timebase }) {
+  if (!active || !payload || !payload.length) return null;
+  const rows = payload.filter((p) => p.value !== null && p.value !== undefined)
+    .sort((a, b) => b.value - a.value);
+  if (!rows.length) return null;
+  return (
+    <div className="rounded border border-[#dededa] dark:border-[#383835] bg-[#fcfcfb] dark:bg-[#1a1a19] px-3 py-2 text-xs shadow-lg">
+      <div className="font-bold mb-1">{label}:00 {timebase === 'local' ? 'local' : 'UTC'}</div>
+      {rows.map((p) => (
+        <div key={p.name} className="flex items-center gap-2">
+          <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: p.color }} />
+          <span className="text-[#52514e] dark:text-[#c3c2b7]">{p.name}</span>
+          <span className="ml-auto tabnum font-semibold">{C.METRICS[metric].fmt(p.value)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BandChart({ agg, band, conts, opts, colors, best }) {
+  const metric = C.METRICS[opts.metric];
+  const data = useMemo(() => HOURS.map((h) => {
+    const row = { hour: pad2(h) };
+    conts.forEach((cont) => {
+      const v = metric.get(agg.get(band, cont, h));
+      row[cont] = metric.signed ? v : (v || 0);
+    });
+    return row;
+  }), [agg, band, conts, opts.metric]);
+
+  const axisInk = colors.axis;
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <LineChart data={data} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
+        <CartesianGrid stroke={colors.grid} strokeDasharray="2 4" vertical={false} />
+        {best && best.bw && (
+          <ReferenceArea
+            x1={pad2(best.bw.start)}
+            x2={pad2((best.bw.start + 2) % 24)}
+            fill={colors.band}
+            fillOpacity={1}
+            ifOverflow="extendDomain"
+          />
+        )}
+        <XAxis dataKey="hour" stroke={axisInk} tickLine={false} axisLine={{ stroke: colors.grid }} interval={1} />
+        <YAxis stroke={axisInk} tickLine={false} axisLine={false} width={44}
+               domain={metric.signed ? ['auto', 'auto'] : [0, 'auto']} />
+        <Tooltip content={<ChartTooltip metric={opts.metric} timebase={opts.timebase} />}
+                 cursor={{ stroke: axisInk, strokeWidth: 1 }} />
+        <Legend wrapperStyle={{ fontSize: 12, color: axisInk }} iconType="plainline" iconSize={16} />
+        {conts.map((cont) => (
+          <Line key={cont} type="monotone" dataKey={cont} name={Continents.LABEL[cont]}
+                stroke={colors.series[cont]} strokeWidth={2} dot={{ r: 0 }}
+                activeDot={{ r: 4, strokeWidth: 2, stroke: colors.surface }}
+                connectNulls={false} isAnimationActive={false} />
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+function HeatStrip({ agg, band, conts, opts, dark }) {
+  const metric = C.METRICS[opts.metric];
+  const ramp = dark ? RAMP_DARK : RAMP_LIGHT;
+  const inks = dark ? INK_DARK : INK_LIGHT;
+  const empty = dark ? '#232322' : '#f0efec';
+
+  const rows = conts.map((cont) => {
+    const values = C.rowValues(agg, band, cont, opts.metric);
+    return {
+      cont,
+      values,
+      bh: C.bestHour(values, metric.signed),
+      bw: C.bestWindow(values, 3, metric.signed)
+    };
+  });
+
+  let lo = Infinity, hi = -Infinity;
+  rows.forEach((r) => r.values.forEach((v) => {
+    if (v === null || (!metric.signed && !v)) return;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }));
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (!metric.signed) lo = 0;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="border-separate border-spacing-[2px] text-[11px]">
+        <thead>
+          <tr>
+            <th className="text-left pr-2 font-semibold">Continent</th>
+            {HOURS.map((h) => (
+              <th key={h} className="font-semibold text-[#52514e] dark:text-[#c3c2b7] w-9">{pad2(h)}</th>
+            ))}
+            <th className="text-left pl-2 font-semibold whitespace-nowrap">Best 3&nbsp;h</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.cont}>
+              <th className="text-left pr-2 font-semibold whitespace-nowrap">{Continents.LABEL[r.cont]}</th>
+              {HOURS.map((h) => {
+                const v = r.values[h];
+                const blank = v === null || (!metric.signed && !v);
+                const idx = blank ? 0 : rampStep(v, lo, hi);
+                const cell = agg.get(band, r.cont, h);
+                const isPeak = r.bh && r.bh.hour === h;
+                const inWin = r.bw && [0, 1, 2].some((k) => (r.bw.start + k) % 24 === h);
+                return (
+                  <td key={h}
+                      title={cell
+                        ? `${Continents.LABEL[r.cont]} · ${band} · ${hourLabel(h, opts.timebase)}\n` +
+                          `${cell.spots} reports from ${cell.nCalls} stations\n` +
+                          `median SNR ${cell.medSnr === null ? 'n/a' : (cell.medSnr > 0 ? '+' : '') + cell.medSnr.toFixed(0) + ' dB'}\n` +
+                          `furthest ${cell.maxKm === null ? 'n/a' : Math.round(cell.maxKm).toLocaleString() + ' km'}` +
+                          (cell.far ? ` (${cell.far})` : '') + '\n' +
+                          `copied on ${cell.nDays} of ${cell.activeDays} active day(s)`
+                        : `${Continents.LABEL[r.cont]} · ${band} · ${hourLabel(h, opts.timebase)}\nno reports`}
+                      className="w-9 h-7 text-center rounded tabnum"
+                      style={{
+                        background: blank ? empty : ramp[idx],
+                        color: blank ? (dark ? '#908f86' : '#78776f') : inks[idx],
+                        boxShadow: isPeak
+                          ? `inset 0 0 0 2px ${dark ? '#d95926' : '#eb6834'}`
+                          : (inWin ? `inset 0 0 0 1px ${dark ? '#908f86' : '#78776f'}` : 'none')
+                      }}>
+                    {blank ? '' : metric.fmt(v)}
+                  </td>
+                );
+              })}
+              <td className="pl-2 whitespace-nowrap tabnum">
+                {r.bw ? `${pad2(r.bw.start)}–${pad2(r.bw.end)}` : '–'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RampLegend({ dark }) {
+  const ramp = dark ? RAMP_DARK : RAMP_LIGHT;
+  const steps = [0, 2, 4, 6, 8, 10, 12];
+  const muted = 'text-[#78776f] dark:text-[#908f86]';
+  return (
+    <div className={'flex items-center gap-2 flex-wrap text-xs mb-3 ' + muted}>
+      <span>low</span>
+      <span className="flex gap-0.5">
+        {steps.map((i) => (
+          <span key={i} className="w-5 h-3 rounded-sm" style={{ background: ramp[i] }} />
+        ))}
+      </span>
+      <span>high</span>
+      <span className="inline-flex items-center gap-1.5 ml-3">
+        <i className="w-3.5 h-3.5 rounded-sm inline-block"
+           style={{ background: dark ? '#232322' : '#f0efec', boxShadow: `inset 0 0 0 2px ${dark ? '#d95926' : '#eb6834'}` }} />
+        peak hour
+      </span>
+      <span className="inline-flex items-center gap-1.5 ml-2">
+        <i className="w-3.5 h-3.5 rounded-sm inline-block"
+           style={{ background: dark ? '#232322' : '#f0efec', boxShadow: `inset 0 0 0 1px ${dark ? '#908f86' : '#78776f'}` }} />
+        best 3&nbsp;h window
+      </span>
+    </div>
+  );
+}
+
+function BestTable({ rows, opts }) {
+  const metric = C.METRICS[opts.metric];
+  if (!rows.length) {
+    return <p className="text-[#78776f] dark:text-[#908f86]">No band and continent pair reaches the minimum report count.</p>;
+  }
+  const th = 'text-left font-semibold text-xs uppercase tracking-wide text-[#78776f] dark:text-[#908f86] px-2 py-1.5 whitespace-nowrap';
+  const td = 'px-2 py-1.5 border-t border-[#dededa] dark:border-[#383835]';
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr>
+            <th className={th}>Band</th>
+            <th className={th}>Continent</th>
+            <th className={th}>Peak hour</th>
+            <th className={th}>Best 3&nbsp;h window</th>
+            <th className={th + ' text-right'}>{metric.label} at peak</th>
+            <th className={th + ' text-right'}>Reports (all hours)</th>
+            <th className={th + ' text-right'}>Stations at peak</th>
+            {opts.metric !== 'snr' && <th className={th + ' text-right'}>Median SNR at peak</th>}
+            <th className={th + ' text-right'}>Furthest at peak</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.band + r.cont} className="hover:bg-[#f4f4f1] dark:hover:bg-[#232322]">
+              <td className={td + ' font-bold'}>{r.band}</td>
+              <td className={td}>{Continents.LABEL[r.cont]}</td>
+              <td className={td + ' font-semibold whitespace-nowrap'}>{hourLabel(r.hour, opts.timebase)}</td>
+              <td className={td + ' whitespace-nowrap'}>{windowLabel(r.bw, opts.timebase)}</td>
+              <td className={td + ' text-right tabnum'}>{metric.fmt(r.score)}</td>
+              <td className={td + ' text-right tabnum'}>{r.spots.toLocaleString()}</td>
+              <td className={td + ' text-right tabnum'}>{r.calls}</td>
+              {opts.metric !== 'snr' && (
+                <td className={td + ' text-right tabnum'}>
+                  {r.medSnr === null ? '–' : `${r.medSnr > 0 ? '+' : ''}${r.medSnr.toFixed(0)} dB`}
+                </td>
+              )}
+              <td className={td + ' text-right tabnum'}>
+                {r.maxKm === null ? '–' : `${Math.round(r.maxKm).toLocaleString()} km`}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------- app */
+
+function App() {
+  const dark = useDark();
+  const [raw, setRaw] = useState(null);           // { fields, names }
+  const [myCall, setMyCall] = useState('');
+  const [candidates, setCandidates] = useState([]);
+  const [dual, setDual] = useState(true);
+  const [status, setStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [opts, setOpts] = useState({
+    metric: 'spots', direction: 'both', mode: 'ALL',
+    timebase: 'utc', minSpots: 3, hfOnly: true
+  });
+
+  const ingest = useCallback((texts, names) => {
+    const t0 = performance.now();
+    const fields = texts.flatMap((t) => C.parseAdif(t));
+    if (!fields.length) {
+      setStatus('No ADIF records in that data. Expected a PSKReporter export with QSO_DATE, TIME_ON and FREQ fields.');
+      setBusy(false);
+      return;
+    }
+    const det = C.detectMyCall(fields);
+    setCandidates(det.candidates);
+    setMyCall(det.call);
+    setDual(det.dual);
+    setRaw({ fields, names });
+    setStatus(`Parsed ${fields.length.toLocaleString()} records in ${Math.round(performance.now() - t0)} ms. ` +
+      (det.dual
+        ? `Treating ${det.call} as your callsign, and splitting the file into the two report directions.`
+        : `No single callsign owns this file, so it is being read as an ordinary log — every row is a station you worked or heard.`));
+    setBusy(false);
+  }, []);
+
+  const onFiles = useCallback((fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setBusy(true);
+    setStatus(`Reading ${files.length} file${files.length === 1 ? '' : 's'}…`);
+    Promise.all(files.map((f) => f.text()))
+      .then((texts) => ingest(texts, files.map((f) => f.name)))
+      .catch((err) => { setStatus('Could not read the file: ' + err.message); setBusy(false); });
+  }, [ingest]);
+
+  const onFetched = useCallback((name, text) => {
+    setBusy(true);
+    setStatus('Parsing the reply from PSKReporter…');
+    ingest([text], [name]);
+  }, [ingest]);
+
+  const built = useMemo(
+    () => (raw ? C.buildRecords(raw.fields, myCall, dual) : null),
+    [raw, myCall, dual]
+  );
+
+  const agg = useMemo(
+    () => (built ? C.aggregate(built.recs, {
+      mode: opts.mode, direction: opts.direction,
+      hfOnly: opts.hfOnly, timebase: opts.timebase
+    }) : null),
+    [built, opts.mode, opts.direction, opts.hfOnly, opts.timebase]
+  );
+
+  const allModes = useMemo(() => {
+    if (!built) return [];
+    const m = {};
+    built.recs.forEach((r) => { m[r.mode] = (m[r.mode] || 0) + 1; });
+    return Object.keys(m).map((k) => ({ name: k, n: m[k] })).sort((a, b) => b.n - a.n);
+  }, [built]);
+
+  const minSpots = Math.max(1, parseInt(opts.minSpots, 10) || 1);
+
+  /* Every band with data gets a section. A band where no continent clears the
+     threshold is still listed, as a one-line summary rather than a chart drawn
+     from two or three reports — silently dropping it would read as "nothing here". */
+  const perBand = useMemo(() => {
+    if (!agg) return [];
+    const metric = C.METRICS[opts.metric];
+    const describe = (band, cont) => {
+      const values = C.rowValues(agg, band, cont, opts.metric);
+      const bh = C.bestHour(values, metric.signed);
+      const bw = C.bestWindow(values, 3, metric.signed);
+      let spots = 0;
+      for (let h = 0; h < 24; h++) { const c = agg.get(band, cont, h); if (c) spots += c.spots; }
+      const peak = bh ? agg.get(band, cont, bh.hour) : null;
+      return {
+        band, cont, spots, bw,
+        hour: bh ? bh.hour : null,
+        score: bh ? bh.score : null,
+        calls: peak ? peak.nCalls : 0,
+        medSnr: peak ? peak.medSnr : null,
+        maxKm: peak ? peak.maxKm : null
+      };
+    };
+    const spotsFor = (band, cont) => {
+      let n = 0;
+      for (let h = 0; h < 24; h++) { const c = agg.get(band, cont, h); if (c) n += c.spots; }
+      return n;
+    };
+
+    return agg.bands.map((band) => {
+      const present = agg.conts.filter((cont) => cont !== 'XX' && spotsFor(band, cont) > 0);
+      const conts = present.filter((cont) => spotsFor(band, cont) >= minSpots);
+      const rows = conts.map((cont) => describe(band, cont)).filter((r) => r.hour !== null);
+      const thinRows = present.map((cont) => describe(band, cont)).filter((r) => r.hour !== null);
+      return {
+        band, conts, rows, thinRows,
+        thin: rows.length === 0,
+        total: agg.bandTotals[band]
+      };
+    });
+  }, [agg, opts.metric, minSpots]);
+
+  const bestRows = useMemo(
+    () => perBand.flatMap((b) => [...b.rows].sort((x, y) => y.spots - x.spots)),
+    [perBand]
+  );
+  const chartedBands = perBand.filter((b) => !b.thin).length;
+
+  const colors = useMemo(() => ({
+    series: dark ? SERIES.dark : SERIES.light,
+    grid: dark ? '#383835' : '#dededa',
+    axis: dark ? '#908f86' : '#78776f',
+    surface: dark ? '#1a1a19' : '#fcfcfb',
+    band: dark ? 'rgba(217,89,38,0.12)' : 'rgba(235,104,52,0.10)'
+  }), [dark]);
+
+  const downloadCsv = useCallback(() => {
+    if (!agg) return;
+    const suffix = opts.timebase === 'local' ? 'local' : 'utc';
+    const lines = ['band,continent,hour_' + suffix +
+      ',reports,unique_stations,unique_entities,median_snr_db,max_distance_km,furthest_station,active_days,reports_per_active_day'];
+    agg.bands.forEach((band) => agg.conts.forEach((cont) => {
+      for (let h = 0; h < 24; h++) {
+        const c = agg.get(band, cont, h);
+        if (!c) continue;
+        lines.push([band, Continents.LABEL[cont], h, c.spots, c.nCalls, c.nDxcc,
+          c.medSnr === null ? '' : c.medSnr.toFixed(1),
+          c.maxKm === null ? '' : Math.round(c.maxKm), c.far,
+          c.activeDays, c.rate.toFixed(2)].join(','));
+      }
+    }));
+    const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'propagation-by-band-continent.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, [agg, opts.timebase]);
+
+  const tiles = agg ? [
+    { label: 'Reports analysed', value: agg.kept.toLocaleString() },
+    { label: 'Unique stations', value: agg.uniqueCalls.toLocaleString() },
+    { label: 'Bands', value: agg.bands.join(', ') || '–' },
+    { label: 'Continents reached', value: agg.conts.filter((c) => c !== 'XX').length },
+    {
+      label: 'Date range',
+      value: agg.minT
+        ? `${new Date(agg.minT).toISOString().slice(0, 10)} → ${new Date(agg.maxT).toISOString().slice(0, 10)} (${agg.nDays}d)`
+        : '–'
+    },
+    {
+      label: dual ? 'Direction split' : 'Source',
+      value: dual && built
+        ? `${built.dirCounts.tx.toLocaleString()} TX / ${built.dirCounts.rx.toLocaleString()} RX`
+        : 'Single-direction log'
+    }
+  ] : [];
+
+  const unmapped = built ? Object.keys(built.unmapped) : [];
+  const myGrids = built ? Object.keys(built.myGrids).sort((a, b) => built.myGrids[b] - built.myGrids[a]).slice(0, 4) : [];
+
+  return (
+    <React.Fragment>
+      <h1 className="text-2xl font-black mb-1">PSKReporter Propagation Analyser</h1>
+      <p className="text-[#52514e] dark:text-[#c3c2b7] max-w-[70ch] mb-6">
+        Drop in an ADIF export from{' '}
+        <a className="text-[#2a78d6] dark:text-[#3987e5] underline" href="https://pskreporter.info" rel="noopener">PSKReporter</a>{' '}
+        to see, band by band, the hours at which each continent is actually within reach.
+        Parsing and analysis happen entirely in this browser tab &mdash; the file is never uploaded.
+      </p>
+
+      <div className="grid gap-4 md:grid-cols-2 items-stretch">
+        <Dropzone onFiles={onFiles} busy={busy} />
+        <FetchPanel onText={onFetched} busy={busy} />
+      </div>
+      {status && <p className="mt-3 text-sm text-[#52514e] dark:text-[#c3c2b7]">{status}</p>}
+
+      {agg && (
+        <React.Fragment>
+          <Controls opts={opts} setOpts={setOpts} modes={allModes} myCall={myCall}
+                    setMyCall={setMyCall} candidates={candidates} dual={dual} onCsv={downloadCsv} />
+          <Tiles items={tiles} />
+
+          <h2 className="text-lg font-bold mt-8 mb-1">Best time per band and continent</h2>
+          <p className="text-sm text-[#78776f] dark:text-[#908f86] mb-3">
+            The three hour window is the strongest contiguous block, which is usually the more
+            practical thing to plan an operating session around.
+          </p>
+          <BestTable rows={bestRows} opts={opts} />
+
+          <h2 className="text-lg font-bold mt-10 mb-1">Hour by hour, band by band</h2>
+          <p className="text-sm text-[#78776f] dark:text-[#908f86] mb-4">
+            One chart per band &mdash; {chartedBands} of {perBand.length} have enough data to plot.
+            Showing {C.METRICS[opts.metric].label.toLowerCase()} against{' '}
+            {opts.timebase === 'local' ? 'local time' : 'UTC'}. In the grid an orange outline marks the
+            peak hour and a thin outline marks the best three hour window. Continents below the{' '}
+            <em>min reports</em> threshold are left out of a band's chart; lower it to pull them in.
+          </p>
+          <RampLegend dark={dark} />
+
+          {perBand.map((b) => {
+            const top = b.rows.reduce((a, r) => (!a || r.spots > a.spots ? r : a), null);
+            return (
+              <section key={b.band} className="mb-10">
+                <div className="flex items-baseline gap-3 flex-wrap mb-2">
+                  <h3 className="text-base font-bold">{b.band}</h3>
+                  <span className="text-sm text-[#78776f] dark:text-[#908f86]">
+                    {b.total.toLocaleString()} report{b.total === 1 ? '' : 's'}
+                    {top && ` · busiest path ${Continents.LABEL[top.cont]} at ${hourLabel(top.hour, opts.timebase)}`}
+                  </span>
+                </div>
+                {b.thin ? (
+                  <div className="rounded-md border border-dashed border-[#dededa] dark:border-[#383835] px-4 py-3 text-sm text-[#52514e] dark:text-[#c3c2b7]">
+                    <p className="mb-1">
+                      Too thin to chart &mdash; no continent reaches the {minSpots}-report threshold.
+                      Everything this band holds:
+                    </p>
+                    <ul className="list-disc pl-5 space-y-0.5">
+                      {b.thinRows.map((r) => (
+                        <li key={r.cont}>
+                          <span className="font-semibold">{Continents.LABEL[r.cont]}</span>
+                          {' '}&mdash; {r.spots} report{r.spots === 1 ? '' : 's'} at {hourLabel(r.hour, opts.timebase)}
+                          {r.maxKm !== null && `, ${Math.round(r.maxKm).toLocaleString()} km`}
+                          {r.medSnr !== null && `, ${r.medSnr > 0 ? '+' : ''}${r.medSnr.toFixed(0)} dB`}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : (
+                  <React.Fragment>
+                    <BandChart agg={agg} band={b.band} conts={b.conts} opts={opts}
+                               colors={colors} best={top} />
+                    <div className="mt-3">
+                      <HeatStrip agg={agg} band={b.band} conts={b.conts} opts={opts} dark={dark} />
+                    </div>
+                  </React.Fragment>
+                )}
+              </section>
+            );
+          })}
+
+          <h2 className="text-lg font-bold mt-10 mb-2">How to read this</h2>
+          <ul className="list-disc pl-5 text-sm text-[#52514e] dark:text-[#c3c2b7] max-w-[75ch] space-y-1.5">
+            <li>A PSKReporter export holds <strong>reception reports, not QSOs</strong>. A hot cell means a
+              signal got through at that hour, which is the best available evidence that a contact was on.</li>
+            <li>The export mixes two directions. On <em>my RX</em> rows you filed the report, so the far
+              end carries a full country and grid. On <em>my TX</em> rows somebody else filed it, the ADIF
+              country field describes <em>you</em>, and the far end is resolved from its grid square instead.
+              Pick a single direction for a clean answer to &ldquo;who can hear me&rdquo; versus
+              &ldquo;who can I hear&rdquo;.</li>
+            <li>Counts are shaped by when <em>you</em> were on the air. An empty hour may be a closed band or
+              a switched-off rig &mdash; <strong>Reports per active day</strong> divides out the hours you were
+              actually active on that band.</li>
+            <li>Monitoring stations are unevenly spread, so compare hours <em>within</em> a row rather than
+              totals between continents.</li>
+            <li>Continents follow the ARRL DXCC assignments: Indonesia and the Philippines count as Oceania,
+              and European Russia is separate from Asiatic Russia.</li>
+          </ul>
+
+          <div className="mt-8 pt-4 border-t border-[#dededa] dark:border-[#383835] text-sm text-[#78776f] dark:text-[#908f86] space-y-1">
+            {agg.contTotals.XX > 0 && (
+              <p><strong>{agg.contTotals.XX.toLocaleString()}</strong> reports could not be placed on a
+                continent and are left out of the tables above.</p>
+            )}
+            {unmapped.length > 0 && (
+              <p>Entities not in the name table, resolved by grid square: {unmapped.slice(0, 15).join(', ')}
+                {unmapped.length > 15 ? `, and ${unmapped.length - 15} more` : ''}.</p>
+            )}
+            {myGrids.length > 0 && <p>Your transmit grid: {myGrids.join(', ')}.</p>}
+            {raw && <p>Loaded: {raw.names.join(', ')}.</p>}
+          </div>
+        </React.Fragment>
+      )}
+
+      <p className="mt-10 text-sm">
+        <a className="text-[#2a78d6] dark:text-[#3987e5] underline" href="../index.html">&larr; All calculators</a>
+      </p>
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+
+</html>
